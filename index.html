@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="theme-color" content="#2e4d25">
+    <title>Yhteinen Metsästyskartta</title>
+    
+    <link rel="manifest" href="manifest.json">
+    
+    <!-- Leaflet CSS & JS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <!-- Leaflet Draw CSS & JS -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet.draw/1.0.4/leaflet.draw.js"></script>
+    
+    <!-- Turf.js -->
+    <script src="https://unpkg.com/@turf/turf@6/turf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.0/proj4.js"></script>
+    <script src="https://unpkg.com/@tmcw/togeojson@5.8.1/dist/togeojson.umd.js"></script>
+
+    <!-- Google Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+
+    <style>
+        * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; font-family: sans-serif; display: flex; flex-direction: column; }
+        #header { background-color: #2e4d25; color: white; padding: 10px; display: flex; justify-content: space-between; align-items: center; z-index: 1000; box-shadow: 0 2px 5px rgba(0,0,0,0.3); flex-wrap: wrap; gap: 5px; }
+        #header h1 { margin: 0; font-size: 1rem; }
+        .controls { display: flex; gap: 5px; flex-wrap: wrap; }
+        .controls button, .controls label { background-color: #4a7c3d; color: white; border: none; padding: 8px 10px; border-radius: 6px; font-size: 0.8rem; font-weight: bold; cursor: pointer; }
+        .controls button:active, .controls label:active { background-color: #3b6330; }
+        .controls button.danger { background-color: #c9302c; }
+        #file-input { display: none; }
+        #map { flex: 1; width: 100%; height: 100%; }
+        #status { font-size: 0.75rem; color: #a3d99b; margin-left: 5px; }
+    </style>
+</head>
+<body>
+
+    <div id="header">
+        <h1>Metsästyskartta <span id="status">(Yhdistetään...)</span></h1>
+        <div class="controls">
+            <button onclick="toggleGPS()">📍 GPS</button>
+            <button onclick="exportGeoJSON()">💾 Vienti</button>
+            <label for="file-input">📂 Tuo</label>
+            <input type="file" id="file-input" accept=".geojson, .json, .kml, .gpx" onchange="importFile(event)">
+            <button class="danger" onclick="clearCloudAreas()">🗑️ Poista kaikki</button>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+        const MML_API_KEY = '87fbc2ca-1b12-429b-9ab7-c38779601195';
+
+        // OMAT FIREBASE-ASETUKSESTI
+        const firebaseConfig = {
+            apiKey: "AIzaSyCjuieKZXK5LqbEssoHs6akP5uYDF6M9u8",
+            authDomain: "metsastyskartta.firebaseapp.com",
+            projectId: "metsastyskartta",
+            storageBucket: "metsastyskartta.firebasestorage.app",
+            messagingSenderId: "571703237057",
+            appId: "1:571703237057:web:32ae8b9fccc5159557f740",
+            measurementId: "G-47B7FTMSE6"
+        };
+
+        // Alustetaan Firebase
+        firebase.initializeApp(firebaseConfig);
+        const db = firebase.firestore();
+
+        proj4.defs("EPSG:3067", "+proj=utm +zone=35 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs");
+
+        const map = L.map('map', { zoomControl: false }).setView([62.6, 29.8], 9);
+        L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+        const mmlMaasto = L.tileLayer(
+            `https://avoin-karttakuva.maanmittauslaitos.fi/avoin/wmts/1.0.0/maastokartta/default/WGS84_Pseudo-Mercator/{z}/{y}/{x}.png?api-key=${MML_API_KEY}`, {
+            maxZoom: 18,
+            attribution: '&copy; Maanmittauslaitos'
+        }).addTo(map);
+
+        const topoLayer = L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {
+            maxZoom: 17,
+            attribution: '&copy; OpenTopoMap'
+        });
+
+        L.control.layers({
+            "MML Maastokartta": mmlMaasto,
+            "OpenTopoMap": topoLayer
+        }, null, { position: 'topright' }).addTo(map);
+
+        const drawnItems = new L.FeatureGroup();
+        map.addLayer(drawnItems);
+
+        const drawControl = new L.Control.Draw({
+            position: 'topleft',
+            draw: {
+                polygon: { allowIntersection: false, showArea: true, shapeOptions: { color: '#d9534f', weight: 3, fillOpacity: 0.3 } },
+                polyline: false, circle: false, rectangle: false, marker: false, circlemarker: false
+            },
+            edit: { featureGroup: drawnItems, remove: true }
+        });
+        map.addControl(drawControl);
+
+        // --- PILVITALLENNUS (Firebase Firestore) ---
+        let isInternalUpdate = false;
+
+        function saveToCloud() {
+            if (isInternalUpdate) return;
+            const data = drawnItems.toGeoJSON();
+            db.collection('kartta').doc('alueet').set({
+                geojson: JSON.stringify(data),
+                updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+            }).then(() => {
+                document.getElementById('status').innerText = "(Tallennettu pilveen)";
+            }).catch((err) => {
+                console.error("Tallennusvirhe:", err);
+                document.getElementById('status').innerText = "(Tallennusvirhe)";
+            });
+        }
+
+        // Kuunnellaan pilven muutoksia REAALIAAJASSA
+        db.collection('kartta').doc('alueet').onSnapshot((doc) => {
+            if (doc.exists && doc.data().geojson) {
+                isInternalUpdate = true;
+                drawnItems.clearLayers();
+                
+                const geojson = JSON.parse(doc.data().geojson);
+                L.geoJSON(geojson, {
+                    style: { color: '#d9534f', weight: 3, fillOpacity: 0.3 },
+                    onEachFeature: function (feature, layer) {
+                        const name = feature.properties?.name || "Metsästysalue";
+                        const area = feature.properties?.area_ha || (turf.area(feature) / 10000).toFixed(2);
+                        layer.bindPopup(`<b>${name}</b><br>Pinta-ala: ${area} ha`);
+                        drawnItems.addLayer(layer);
+                    }
+                });
+                
+                document.getElementById('status').innerText = "(Yhdistetty pilveen)";
+                isInternalUpdate = false;
+            } else {
+                document.getElementById('status').innerText = "(Pilvi tyhjä)";
+            }
+        }, (error) => {
+            console.error("Tietokantavirhe:", error);
+            document.getElementById('status').innerText = "(Yhteysvirhe - tarkista säännöt)";
+        });
+
+        function clearCloudAreas() {
+            if (confirm("Haluatko varmasti poistaa alueet KAIKILTA käyttäjiltä?")) {
+                drawnItems.clearLayers();
+                saveToCloud();
+            }
+        }
+
+        map.on(L.Draw.Event.CREATED, function (e) {
+            const layer = e.layer;
+            const geojson = layer.toGeoJSON();
+            const areaInHectares = (turf.area(geojson) / 10000).toFixed(2);
+            const name = prompt("Anna alueen / reviirin nimi:", "Metsästysalue") || "Nimetön alue";
+
+            layer.feature = layer.feature || { type: 'Feature', properties: {} };
+            layer.feature.properties.name = name;
+            layer.feature.properties.area_ha = areaInHectares;
+
+            layer.bindPopup(`<b>${name}</b><br>Pinta-ala: ${areaInHectares} ha`);
+            drawnItems.addLayer(layer);
+            saveToCloud();
+        });
+
+        map.on(L.Draw.Event.EDITED, saveToCloud);
+        map.on(L.Draw.Event.DELETED, saveToCloud);
+
+        // Tiedostontuonti
+        function importFile(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const filename = file.name.toLowerCase();
+            const reader = new FileReader();
+
+            reader.onload = function (e) {
+                try {
+                    let geojson;
+                    const content = e.target.result;
+
+                    if (filename.endsWith('.kml')) {
+                        const dom = new DOMParser().parseFromString(content, 'text/xml');
+                        geojson = toGeoJSON.kml(dom);
+                    } else if (filename.endsWith('.gpx')) {
+                        const dom = new DOMParser().parseFromString(content, 'text/xml');
+                        geojson = toGeoJSON.gpx(dom);
+                    } else {
+                        geojson = JSON.parse(content);
+                    }
+
+                    geojson = fixCoordinatesIfNeeded(geojson);
+
+                    let loadedCount = 0;
+                    const newLayerGroup = L.geoJSON(geojson, {
+                        style: { color: '#d9534f', weight: 3, fillOpacity: 0.3 },
+                        onEachFeature: function (feature, layer) {
+                            loadedCount++;
+                            const name = feature.properties?.name || feature.properties?.title || "Tuotu alue";
+                            let area = "0";
+                            try { area = (turf.area(feature) / 10000).toFixed(2); } catch(err) {}
+
+                            layer.bindPopup(`<b>${name}</b><br>Pinta-ala: ${area} ha`);
+                            drawnItems.addLayer(layer);
+                        }
+                    });
+
+                    if (loadedCount > 0) {
+                        map.fitBounds(newLayerGroup.getBounds());
+                        saveToCloud();
+                        alert(`Tuotiin ja tallennettiin pilveen ${loadedCount} kohdetta!`);
+                    }
+                } catch (err) {
+                    alert("Virhe tiedoston luvussa: " + err.message);
+                }
+            };
+            reader.readAsText(file);
+        }
+
+        function fixCoordinatesIfNeeded(geojson) {
+            if (!geojson) return geojson;
+            turf.coordEach(geojson, function (coord) {
+                if (Math.abs(coord[0]) > 1000 || Math.abs(coord[1]) > 1000) {
+                    const converted = proj4("EPSG:3067", "EPSG:4326", [coord[0], coord[1]]);
+                    coord[0] = converted[0];
+                    coord[1] = converted[1];
+                }
+            });
+            return geojson;
+        }
+
+        // GPS
+        let locationMarker, locationCircle, isTracking = false;
+        function toggleGPS() {
+            if (!isTracking) {
+                map.locate({ setView: true, maxZoom: 15, watch: true, enableHighAccuracy: true });
+                isTracking = true;
+            } else {
+                map.stopLocate();
+                if (locationMarker) map.removeLayer(locationMarker);
+                if (locationCircle) map.removeLayer(locationCircle);
+                isTracking = false;
+            }
+        }
+
+        map.on('locationfound', function(e) {
+            const radius = e.accuracy / 2;
+            if (locationMarker) {
+                locationMarker.setLatLng(e.latlng);
+                locationCircle.setLatLng(e.latlng).setRadius(radius);
+            } else {
+                locationMarker = L.marker(e.latlng).addTo(map).bindPopup("Olet tässä");
+                locationCircle = L.circle(e.latlng, radius, { color: '#136AEC', fillOpacity: 0.2 }).addTo(map);
+            }
+        });
+
+        map.on('locationerror', function(e) { alert("GPS-virhe: " + e.message); isTracking = false; });
+
+        function exportGeoJSON() {
+            const data = drawnItems.toGeoJSON();
+            if (data.features.length === 0) return alert("Ei piirrettyjä alueita.");
+            const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'metsastysalueet.geojson';
+            a.click();
+        }
+
+        if ('serviceWorker' in navigator) { navigator.serviceWorker.register('sw.js'); }
+    </script>
+</body>
+</html>
