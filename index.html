@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Metsästyskartta PWA</title>
+
+  <!-- PWA Manifest & App Icon Info -->
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#1b4332">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+  <!-- Leaflet CSS & JS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+    body, html, #map { width: 100%; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #111; }
+
+    /* Yläpalkki / Control Bar */
+    .top-bar {
+      position: absolute; top: 12px; left: 12px; right: 12px; z-index: 1000;
+      background: rgba(18, 18, 18, 0.9); backdrop-filter: blur(8px);
+      padding: 10px 14px; border-radius: 12px; display: flex;
+      justify-content: space-between; align-items: center; color: #fff;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.1);
+    }
+    .role-toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+    .switch { position: relative; display: inline-block; width: 44px; height: 24px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #2d6a4f; transition: .3s; border-radius: 24px; }
+    .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
+    input:checked + .slider { background-color: #d90429; }
+    input:checked + .slider:before { transform: translateX(20px); }
+
+    /* Dev Panel Overlay */
+    .dev-panel {
+      position: absolute; top: 70px; left: 12px; right: 12px; z-index: 999;
+      background: rgba(20, 20, 20, 0.95); border: 1px solid #d90429;
+      border-radius: 10px; padding: 12px; color: #00f5d4; font-family: monospace; font-size: 11px;
+      display: none; box-shadow: 0 4px 20px rgba(217, 4, 41, 0.2);
+    }
+
+    /* Floating Action Buttons */
+    .controls { position: absolute; bottom: 25px; left: 12px; right: 12px; z-index: 1000; display: flex; justify-content: space-between; gap: 10px; }
+    .btn {
+      background: #2d6a4f; color: #fff; border: none; padding: 12px 18px; border-radius: 25px;
+      font-weight: bold; font-size: 13px; cursor: pointer; display: flex; align-items: center; gap: 6px;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.3); transition: transform 0.1s;
+    }
+    .btn:active { transform: scale(0.96); }
+    .btn-dev { background: #d90429; }
+
+    /* Modal for Layer Picker */
+    .modal {
+      position: absolute; top: 0; left: 0; right: 0; bottom: 0; z-index: 2000;
+      background: rgba(0,0,0,0.7); display: none; justify-content: flex-end; flex-direction: column;
+    }
+    .modal-content {
+      background: #1e1e1e; border-top-left-radius: 20px; border-top-right-radius: 20px;
+      padding: 20px; color: #fff; max-height: 70vh; overflow-y: auto;
+    }
+    .layer-option {
+      padding: 12px; background: #2a2a2a; border-radius: 8px; margin-bottom: 8px;
+      display: flex; justify-content: space-between; align-items: center; cursor: pointer;
+    }
+    .layer-option.active { background: #1b4332; border: 1px solid #52b788; }
+  </style>
+</head>
+<body>
+
+  <!-- Top Controls Bar -->
+  <div class="top-bar">
+    <div class="role-toggle">
+      <span id="label-user" style="color: #52b788;">Käyttäjä</span>
+      <label class="switch">
+        <input type="checkbox" id="role-switch" onchange="toggleRole(this.checked)">
+        <span class="slider"></span>
+      </label>
+      <span id="label-dev" style="color: #888;">Kehittäjä</span>
+    </div>
+    <button id="dev-btn" class="btn btn-dev" style="display:none; padding: 6px 12px; font-size: 11px;" onclick="toggleDevPanel()">🛠️ Dev Tools</button>
+  </div>
+
+  <!-- Developer Console Overlay -->
+  <div id="dev-panel" class="dev-panel">
+    <strong style="color: #ff4d6d;">🛠️ KEHITTÄJÄ-TILAN DEBUG-LOKI</strong><br>
+    <div id="dev-log" style="margin-top: 6px; line-height: 1.5;">Odotetaan tapahtumia...</div>
+    <input type="file" id="file-input" style="display:none" onchange="handleFileUpload(event)">
+    <button class="btn btn-dev" style="margin-top: 10px; width: 100%; justify-content: center;" onclick="document.getElementById('file-input').click()">Tuo Reviiri (KML/GPX)</button>
+  </div>
+
+  <!-- Map Container -->
+  <div id="map"></div>
+
+  <!-- Bottom Floating Action Buttons -->
+  <div class="controls">
+    <button class="btn" id="layer-btn" onclick="openLayerModal()">🗺️ Karttatasot</button>
+    <button class="btn" onclick="locateUser()">🎯 Oma Sijainti</button>
+  </div>
+
+  <!-- Layer Picker Modal -->
+  <div id="layer-modal" class="modal" onclick="closeLayerModal(event)">
+    <div class="modal-content" onclick="event.stopPropagation()">
+      <h3 style="margin-bottom: 15px;">🗺️ Valitse Karttataso</h3>
+      <div id="layer-options-container"></div>
+      <hr style="border-color: #333; margin: 15px 0;">
+      <label style="display: flex; justify-content: space-between; align-items: center; font-size: 14px;">
+        <span>Kiinteistörajat (MML Overlay)</span>
+        <input type="checkbox" id="overlay-toggle" onchange="togglePropertyOverlay(this.checked)" checked style="width: 20px; height: 20px;">
+      </label>
+    </div>
+  </div>
+
+  <script>
+    let currentRole = 'user';
+    let map, userMarker, propertyLayer;
+    
+    // Suojattujen WMS/WMTS -karttatasojen URL-pohjat (MML API Key voidaan liittää perään ?api-key=...)
+    const API_KEY = ""; // Syötä Reviiri tai MML API-avain tähän tarvittaessa
+    const apiKeyParam = API_KEY ? `?api-key=${API_KEY}` : '';
+
+    const LAYERS = {
+      maasto: L.tileLayer(`https://avoin-karttakuva.maanmittauslaitos.fi/avoin/wmts/1.0.0/maastokartta/default/WGS84_Pseudo-Mercator/{z}/{y}/{x}.png${apiKeyParam}`, { maxZoom: 19, attribution: 'MML' }),
+      ilmakuva: L.tileLayer(`https://avoin-karttakuva.maanmittauslaitos.fi/avoin/wmts/1.0.0/ortokuva/default/WGS84_Pseudo-Mercator/{z}/{y}/{x}.jpg${apiKeyParam}`, { maxZoom: 19, attribution: 'MML' }),
+      selko: L.tileLayer(`https://avoin-karttakuva.maanmittauslaitos.fi/avoin/wmts/1.0.0/selkokartta/default/WGS84_Pseudo-Mercator/{z}/{y}/{x}.png${apiKeyParam}`, { maxZoom: 19, attribution: 'MML' })
+    };
+
+    let activeLayerKey = 'maasto';
+
+    // Alustetaan kartta (Karhunpää/Joensuu -alue)
+    function initMap() {
+      map = L.map('map', { zoomControl: false }).setView([63.225, 29.530], 13);
+      LAYERS[activeLayerKey].addTo(map);
+
+      // Lisätään Kiinteistörajat Overlayna
+      propertyLayer = L.tileLayer(`https://avoin-karttakuva.maanmittauslaitos.fi/avoin/wmts/1.0.0/kiinteistorajat/default/WGS84_Pseudo-Mercator/{z}/{y}/{x}.png${apiKeyParam}`, {
+        maxZoom: 19, opacity: 0.6
+      }).addTo(map);
+
+      // Esimerkki Reviiri-metsästysalueesta
+      const reviiriZone = L.polygon([
+        [63.221, 29.510], [63.235, 29.525], [63.230, 29.560], [63.210, 29.540]
+      ], {
+        color: '#1b4332', fillColor: '#2d6a4f', fillOpacity: 0.35, weight: 3
+      }).addTo(map);
+      reviiriZone.bindPopup("<b>Karhunpään maasto</b><br>Pinta-ala: 420.5 ha");
+
+      // Kartan klikkaus (Passin tai rajapisteen lisäys)
+      map.on('click', (e) => {
+        if (currentRole === 'user') {
+          L.marker(e.latlng).addTo(map).bindPopup("Passipaikka").openPopup();
+        } else {
+          logDev(`Uusi rajapiste valittu: Lat ${e.latlng.lat.toFixed(5)}, Lng ${e.latlng.lng.toFixed(5)}`);
+        }
+      });
+
+      locateUser();
+    }
+
+    // Käyttäjän GPS-paikannus
+    function locateUser() {
+      map.locate({ setView: true, maxZoom: 15 });
+      map.on('locationfound', (e) => {
+        if (userMarker) map.removeLayer(userMarker);
+        userMarker = L.circleMarker(e.latlng, { radius: 8, color: '#fff', fillColor: '#007bff', fillOpacity: 1 }).addTo(map);
+        logDev(`GPS Paikannettu: ${e.latlng.lat.toFixed(4)}, ${e.latlng.lng.toFixed(4)}`);
+      });
+    }
+
+    // Käyttäjä- vs Kehittäjätilan vaihto
+    function toggleRole(isDev) {
+      currentRole = isDev ? 'developer' : 'user';
+      document.getElementById('label-user').style.color = isDev ? '#888' : '#52b788';
+      document.getElementById('label-dev').style.color = isDev ? '#ff4d6d' : '#888';
+      document.getElementById('dev-btn').style.display = isDev ? 'block' : 'none';
+      if (!isDev) document.getElementById('dev-panel').style.display = 'none';
+      logDev(`Rooli vaihdettu: ${currentRole}`);
+    }
+
+    function toggleDevPanel() {
+      const panel = document.getElementById('dev-panel');
+      panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
+    }
+
+    function logDev(msg) {
+      const log = document.getElementById('dev-log');
+      log.innerHTML = `> ${msg}<br>` + log.innerHTML;
+    }
+
+    // Karttatasojen hallinta
+    function openLayerModal() {
+      const container = document.getElementById('layer-options-container');
+      container.innerHTML = '';
+      const names = { maasto: 'Maastokartta (MML)', ilmakuva: 'Ilmakuva / Orto (MML)', selko: 'Selkokartta (Selkeä)' };
+
+      Object.keys(LAYERS).forEach(key => {
+        const div = document.createElement('div');
+        div.className = `layer-option ${activeLayerKey === key ? 'active' : ''}`;
+        div.innerHTML = `<span>${names[key]}</span> ${activeLayerKey === key ? '✓' : ''}`;
+        div.onclick = () => switchLayer(key);
+        container.appendChild(div);
+      });
+
+      document.getElementById('layer-modal').style.display = 'flex';
+    }
+
+    function closeLayerModal(e) {
+      document.getElementById('layer-modal').style.display = 'none';
+    }
+
+    function switchLayer(key) {
+      map.removeLayer(LAYERS[activeLayerKey]);
+      activeLayerKey = key;
+      LAYERS[activeLayerKey].addTo(map);
+      closeLayerModal();
+      logDev(`Karttataso vaihdettu: ${key}`);
+    }
+
+    function togglePropertyOverlay(show) {
+      if (show) map.addLayer(propertyLayer);
+      else map.removeLayer(propertyLayer);
+      logDev(`Kiinteistörajat: ${show ? 'ON' : 'OFF'}`);
+    }
+
+    function handleFileUpload(e) {
+      const file = e.target.files[0];
+      if (file) {
+        logDev(`Tiedosto ladattu: ${file.name} (${file.size} bytes)`);
+        alert(`Reviiri-tiedosto "${file.name}" tuotu ja parsettu kartalle.`);
+      }
+    }
+
+    window.onload = initMap;
+  </script>
+</body>
+</html>
